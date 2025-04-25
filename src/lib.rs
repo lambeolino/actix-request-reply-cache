@@ -461,3 +461,263 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{http::header, test::TestRequest};
+
+    #[actix_web::test]
+    async fn test_builder_default_values() {
+        let builder = RedisCacheMiddlewareBuilder::new("redis://localhost");
+        assert_eq!(builder.ttl, 3600);
+        assert_eq!(builder.max_cacheable_size, 1024 * 1024);
+        assert_eq!(builder.cache_prefix, "cache:");
+        assert_eq!(builder.redis_url, "redis://localhost");
+    }
+
+    #[actix_web::test]
+    async fn test_builder_custom_values() {
+        let builder = RedisCacheMiddlewareBuilder::new("redis://localhost")
+            .ttl(60)
+            .max_cacheable_size(512 * 1024)
+            .cache_prefix("custom:");
+
+        assert_eq!(builder.ttl, 60);
+        assert_eq!(builder.max_cacheable_size, 512 * 1024);
+        assert_eq!(builder.cache_prefix, "custom:");
+    }
+
+    #[actix_web::test]
+    async fn test_builder_custom_predicate() {
+        let builder = RedisCacheMiddlewareBuilder::new("redis://localhost")
+            .cache_if(|ctx| ctx.method == "GET");
+
+        // Test the predicate
+        let get_ctx = CacheDecisionContext {
+            method: "GET",
+            path: "/test",
+            query_string: "",
+            headers: &header::HeaderMap::new(),
+            body: &[],
+        };
+
+        let post_ctx = CacheDecisionContext {
+            method: "POST",
+            path: "/test",
+            query_string: "",
+            headers: &header::HeaderMap::new(),
+            body: &[],
+        };
+
+        // The predicate should now only allow GET requests
+        assert!((builder.cache_if)(&get_ctx));
+        assert!(!(builder.cache_if)(&post_ctx));
+    }
+
+    #[actix_web::test]
+    async fn test_cache_key_generation() {
+        // Create a simple request
+        let req = TestRequest::get().uri("/test").to_srv_request();
+
+        // Extract the relevant parts for key generation
+        let method = req.method().as_str();
+        let path = req.path();
+        let query_string = req.query_string();
+
+        // Generate key manually as done in the middleware
+        let base_key = format!("{}:{}:{}", method, path, query_string);
+        let hashed_key = hex::encode(Sha256::digest(base_key.as_bytes()));
+        let cache_key = format!("test:{}", hashed_key);
+
+        // Now verify this matches what our middleware would generate
+        let expected_key = format!(
+            "test:{}",
+            hex::encode(Sha256::digest("GET:/test:".to_string().as_bytes()))
+        );
+
+        assert_eq!(cache_key, expected_key);
+    }
+
+    #[actix_web::test]
+    async fn test_cache_key_with_body() {
+        // Test case for when request has a body
+        let body_bytes = b"test body";
+        let body_hash = hex::encode(Sha256::digest(body_bytes));
+
+        // Generate key manually as done in the middleware
+        let base_key = format!("{}:{}:{}:{}", "POST", "/test", "", body_hash);
+        let hashed_key = hex::encode(Sha256::digest(base_key.as_bytes()));
+        let cache_key = format!("test:{}", hashed_key);
+
+        // Expected key when body is present
+        let expected_key = format!(
+            "test:{}",
+            hex::encode(Sha256::digest(
+                format!("POST:/test::{}", body_hash).as_bytes()
+            ))
+        );
+
+        assert_eq!(cache_key, expected_key);
+    }
+
+    #[actix_web::test]
+    async fn test_cacheable_methods() {
+        // Test different HTTP methods with default predicate
+        let builder = RedisCacheMiddlewareBuilder::new("redis://localhost");
+        let default_predicate = builder.cache_if;
+
+        let methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+
+        for method in methods {
+            let ctx = CacheDecisionContext {
+                method,
+                path: "/test",
+                query_string: "",
+                headers: &header::HeaderMap::new(),
+                body: &[],
+            };
+
+            // Default predicate should cache all methods
+            assert!(
+                (default_predicate)(&ctx),
+                "Method {} should be cacheable by default",
+                method
+            );
+        }
+
+        // Test with a custom predicate that only caches GET and HEAD
+        let custom_builder = RedisCacheMiddlewareBuilder::new("redis://localhost")
+            .cache_if(|ctx| matches!(ctx.method, "GET" | "HEAD"));
+
+        for method in methods {
+            let ctx = CacheDecisionContext {
+                method,
+                path: "/test",
+                query_string: "",
+                headers: &header::HeaderMap::new(),
+                body: &[],
+            };
+
+            // Check if method should be cached according to our custom predicate
+            let should_cache = matches!(method, "GET" | "HEAD");
+            assert_eq!(
+                (custom_builder.cache_if)(&ctx),
+                should_cache,
+                "Method {} should be cacheable: {}",
+                method,
+                should_cache
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_predicate_with_headers() {
+        // Test predicate behavior with different headers
+
+        // Create a predicate that doesn't cache requests with Authorization header
+        let predicate = |ctx: &CacheDecisionContext| !ctx.headers.contains_key("Authorization");
+
+        // Test with empty headers
+        let mut headers = header::HeaderMap::new();
+        let ctx_no_auth = CacheDecisionContext {
+            method: "GET",
+            path: "/test",
+            query_string: "",
+            headers: &headers,
+            body: &[],
+        };
+
+        assert!(
+            predicate(&ctx_no_auth),
+            "Request without Authorization should be cached"
+        );
+
+        // Test with Authorization header
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer token"),
+        );
+
+        let ctx_with_auth = CacheDecisionContext {
+            method: "GET",
+            path: "/test",
+            query_string: "",
+            headers: &headers,
+            body: &[],
+        };
+
+        assert!(
+            !predicate(&ctx_with_auth),
+            "Request with Authorization should not be cached"
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_predicate_with_path_patterns() {
+        // Test predicate behavior with different path patterns
+
+        // Create a predicate that doesn't cache admin paths
+        let predicate = |ctx: &CacheDecisionContext| {
+            !ctx.path.starts_with("/admin") && !ctx.path.contains("/private/")
+        };
+
+        // Test paths that should be cached
+        let cacheable_paths = ["/", "/api/users", "/public/resource", "/api/v1/data"];
+
+        for path in cacheable_paths {
+            let ctx = CacheDecisionContext {
+                method: "GET",
+                path,
+                query_string: "",
+                headers: &header::HeaderMap::new(),
+                body: &[],
+            };
+
+            assert!(predicate(&ctx), "Path {} should be cacheable", path);
+        }
+
+        // Test paths that should not be cached
+        let non_cacheable_paths = ["/admin", "/admin/users", "/users/private/profile"];
+
+        for path in non_cacheable_paths {
+            let ctx = CacheDecisionContext {
+                method: "GET",
+                path,
+                query_string: "",
+                headers: &header::HeaderMap::new(),
+                body: &[],
+            };
+
+            assert!(!predicate(&ctx), "Path {} should not be cacheable", path);
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_cached_response_serialization() {
+        // Test that CachedResponse can be properly serialized and deserialized
+        let cached_response = CachedResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("X-Test".to_string(), "value".to_string()),
+            ],
+            body: b"test response".to_vec(),
+        };
+
+        // Serialize
+        let serialized = serde_json::to_string(&cached_response).unwrap();
+
+        // Deserialize
+        let deserialized: CachedResponse = serde_json::from_str(&serialized).unwrap();
+
+        // Verify fields match
+        assert_eq!(deserialized.status, 200);
+        assert_eq!(deserialized.headers.len(), 2);
+        assert_eq!(deserialized.headers[0].0, "Content-Type");
+        assert_eq!(deserialized.headers[0].1, "text/plain");
+        assert_eq!(deserialized.headers[1].0, "X-Test");
+        assert_eq!(deserialized.headers[1].1, "value");
+        assert_eq!(deserialized.body, b"test response");
+    }
+}

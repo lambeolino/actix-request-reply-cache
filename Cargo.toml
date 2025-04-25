@@ -16,3 +16,7 @@ sha2 = "0.10"
 hex = "0.4"
 log = "0.4.27"
 tokio = "1.44.2"
+
+[dev-dependencies]
+actix-rt = "2.8.0"
+async-trait = "0.1.73"
