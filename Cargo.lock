@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "actix-request-reply-cache"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "actix-rt",
  "actix-web",
@@ -83,6 +83,7 @@ dependencies = [
  "redis",
  "rmp-serde",
  "serde",
+ "serde_json",
  "sha2",
 ]
 

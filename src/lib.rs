@@ -79,7 +79,7 @@ pub struct CacheDecisionContext<'a> {
     /// HTTP headers from the request
     pub headers: &'a HeaderMap,
     /// The request body as a byte slice
-    pub body: &'a [u8],
+    pub body: &'a serde_json::Value,
 }
 
 /// Function type for cache decision predicates.
@@ -515,7 +515,7 @@ where
                 path: req.path(),
                 query_string: req.query_string(),
                 headers: req.headers(),
-                body: &body_bytes,
+                body: &serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null),
             };
 
             let should_cache = cache_if(&cache_ctx);
@@ -644,7 +644,7 @@ mod tests {
             path: "/test",
             query_string: "",
             headers: &header::HeaderMap::new(),
-            body: &[],
+            body: &serde_json::Value::Null,
         };
 
         let post_ctx = CacheDecisionContext {
@@ -652,7 +652,7 @@ mod tests {
             path: "/test",
             query_string: "",
             headers: &header::HeaderMap::new(),
-            body: &[],
+            body: &serde_json::Value::Null,
         };
 
         // The predicate should now only allow GET requests
@@ -720,7 +720,7 @@ mod tests {
                 path: "/test",
                 query_string: "",
                 headers: &header::HeaderMap::new(),
-                body: &[],
+                body: &serde_json::Value::Null,
             };
 
             // Default predicate should cache all methods
@@ -741,7 +741,7 @@ mod tests {
                 path: "/test",
                 query_string: "",
                 headers: &header::HeaderMap::new(),
-                body: &[],
+                body: &serde_json::Value::Null,
             };
 
             // Check if method should be cached according to our custom predicate
@@ -770,7 +770,7 @@ mod tests {
             path: "/test",
             query_string: "",
             headers: &headers,
-            body: &[],
+            body: &serde_json::Value::Null,
         };
 
         assert!(
@@ -789,7 +789,7 @@ mod tests {
             path: "/test",
             query_string: "",
             headers: &headers,
-            body: &[],
+            body: &serde_json::Value::Null,
         };
 
         assert!(
@@ -816,7 +816,7 @@ mod tests {
                 path,
                 query_string: "",
                 headers: &header::HeaderMap::new(),
-                body: &[],
+                body: &serde_json::Value::Null,
             };
 
             assert!(predicate(&ctx), "Path {} should be cacheable", path);
@@ -831,7 +831,7 @@ mod tests {
                 path,
                 query_string: "",
                 headers: &header::HeaderMap::new(),
-                body: &[],
+                body: &serde_json::Value::Null,
             };
 
             assert!(!predicate(&ctx), "Path {} should not be cacheable", path);
