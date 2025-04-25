@@ -70,14 +70,16 @@ dependencies = [
 
 [[package]]
 name = "actix-request-reply-cache"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "actix-rt",
  "actix-web",
  "async-trait",
  "futures",
+ "futures-util",
  "hex",
  "log",
+ "pin-project-lite",
  "redis",
  "serde",
  "serde_json",

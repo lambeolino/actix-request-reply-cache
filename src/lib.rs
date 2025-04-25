@@ -45,7 +45,7 @@
 //! }
 //! ```
 use actix_web::{
-    body::{BoxBody, EitherBody, MessageBody},
+    body::{BodySize, BoxBody, EitherBody, MessageBody},
     dev::{forward_ready, Payload, Service, ServiceRequest, ServiceResponse, Transform},
     http::header::HeaderMap,
     web::{Bytes, BytesMut},
@@ -55,11 +55,15 @@ use futures::{
     future::{ready, LocalBoxFuture, Ready},
     StreamExt,
 };
+use pin_project_lite::pin_project;
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::rc::Rc;
-use std::sync::Arc;
+use std::{future::Future, marker::PhantomData, pin::Pin, rc::Rc};
+use std::{
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 /// Context used to determine if a request/response should be cached.
 ///
@@ -274,7 +278,7 @@ impl<S, B> Transform<S, ServiceRequest> for RedisCacheMiddleware
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
-    B: 'static + Clone + MessageBody,
+    B: 'static + MessageBody,
 {
     type Response = ServiceResponse<EitherBody<B, BoxBody>>;
     type Error = Error;
@@ -296,11 +300,175 @@ where
     }
 }
 
+// Define the wrapper structure for your response future
+pin_project! {
+    struct CacheResponseFuture<S, B>
+    where
+        B: MessageBody,
+        S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    {
+        #[pin]
+        fut: S::Future,
+        should_cache: bool,
+        cache_key: String,
+        redis_conn: Option<MultiplexedConnection>,
+        redis_url: String,
+        ttl: u64,
+        max_cacheable_size: usize,
+        _marker: PhantomData<B>,
+    }
+}
+
+// Implement the Future trait for your response future
+impl<S, B> Future for CacheResponseFuture<S, B>
+where
+    B: MessageBody + 'static,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+{
+    type Output = Result<ServiceResponse<EitherBody<B, BoxBody>>, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        let res = futures_util::ready!(this.fut.poll(cx))?;
+
+        let status = res.status();
+        let headers = res.headers().clone();
+        let should_cache = *this.should_cache && status.is_success();
+
+        if !should_cache {
+            return Poll::Ready(Ok(res.map_body(|_, b| EitherBody::left(b))));
+        }
+
+        let cache_key = this.cache_key.clone();
+        let redis_url = this.redis_url.clone();
+        let redis_conn = this.redis_conn.clone();
+        let ttl = *this.ttl;
+        let max_size = *this.max_cacheable_size;
+
+        let res = res.map_body(move |_, body| {
+            let filtered_headers = headers
+                .iter()
+                .filter(|(name, _)| {
+                    !["connection", "transfer-encoding", "content-length"]
+                        .contains(&name.as_str().to_lowercase().as_str())
+                })
+                .map(|(name, value)| {
+                    (
+                        name.to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            EitherBody::right(BoxBody::new(CacheableBody {
+                body: body.boxed(),
+                status: status.as_u16(),
+                headers: filtered_headers,
+                body_accum: BytesMut::new(),
+                cache_key,
+                redis_conn,
+                redis_url,
+                ttl,
+                max_size,
+            }))
+        });
+
+        Poll::Ready(Ok(res))
+    }
+}
+
+// Define the body wrapper that will accumulate data
+pin_project! {
+    struct CacheableBody {
+        #[pin]
+        body: BoxBody,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body_accum: BytesMut,
+        cache_key: String,
+        redis_conn: Option<MultiplexedConnection>,
+        redis_url: String,
+        ttl: u64,
+        max_size: usize,
+    }
+
+    impl PinnedDrop for CacheableBody {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+
+            let body_bytes = this.body_accum.clone().freeze();
+            let status = *this.status;
+            let headers = this.headers.clone();
+            let cache_key = this.cache_key.clone();
+            let mut redis_conn = this.redis_conn.take();
+            let redis_url = this.redis_url.clone();
+            let ttl = *this.ttl;
+            let max_size = *this.max_size;
+
+            if !body_bytes.is_empty() && body_bytes.len() <= max_size {
+                actix_web::rt::spawn(async move {
+                    let cached_response = CachedResponse {
+                        status,
+                        headers,
+                        body: body_bytes.to_vec(),
+                    };
+
+                    if let Ok(serialized) = serde_json::to_string(&cached_response) {
+                        if redis_conn.is_none() {
+                            let client = redis::Client::open(redis_url.as_str())
+                                .expect("Failed to connect to Redis");
+
+                            let conn = client
+                                .get_multiplexed_async_connection()
+                                .await
+                                .expect("Failed to get Redis connection");
+
+                            redis_conn = Some(conn);
+                        }
+
+                        if let Some(conn) = redis_conn.as_mut() {
+                            let _: Result<(), redis::RedisError> =
+                                conn.set_ex(cache_key, serialized, ttl).await;
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+impl MessageBody for CacheableBody {
+    type Error = <BoxBody as MessageBody>::Error;
+
+    fn size(&self) -> BodySize {
+        self.body.size()
+    }
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, Self::Error>>> {
+        let this = self.project();
+
+        // Poll the inner body and accumulate data
+        match this.body.poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.body_accum.extend_from_slice(&chunk);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl<S, B> Service<ServiceRequest> for RedisCacheMiddlewareService<S>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
-    B: actix_web::body::MessageBody + 'static + Clone,
+    B: MessageBody + 'static,
 {
     type Response = ServiceResponse<EitherBody<B, BoxBody>>;
     type Error = Error;
@@ -309,6 +477,7 @@ where
     forward_ready!(service);
 
     fn call(&self, mut req: ServiceRequest) -> Self::Future {
+        // Skip caching if Cache-Control says no-cache/no-store
         if let Some(cache_control) = req.headers().get("Cache-Control") {
             if let Ok(cache_control_str) = cache_control.to_str() {
                 if cache_control_str.contains("no-cache") || cache_control_str.contains("no-store")
@@ -353,6 +522,7 @@ where
 
             req.set_payload(Payload::from(Bytes::from(body_bytes.clone())));
 
+            // Generate cache key
             let base_key = if body_bytes.is_empty() {
                 format!(
                     "{}:{}:{}",
@@ -374,7 +544,6 @@ where
             let hashed_key = hex::encode(Sha256::digest(base_key.as_bytes()));
             let cache_key = format!("{}{}", cache_prefix, hashed_key);
 
-            // Only try to get from cache if we're considering caching for this request
             let cached_result: Option<String> = if should_cache {
                 if redis_conn.is_none() {
                     let client = redis::Client::open(redis_url.as_str())
@@ -397,7 +566,6 @@ where
             if let Some(cached_data) = cached_result {
                 log::debug!("Cache hit for {}", cache_key);
 
-                // Deserialize cached response
                 match serde_json::from_str::<CachedResponse>(&cached_data) {
                     Ok(cached_response) => {
                         let mut response = actix_web::HttpResponse::build(
@@ -423,60 +591,18 @@ where
             }
 
             log::debug!("Cache miss for {}", cache_key);
+            let future = CacheResponseFuture::<S, B> {
+                fut: service.call(req),
+                should_cache,
+                cache_key,
+                redis_conn,
+                redis_url,
+                ttl: expiration,
+                max_cacheable_size,
+                _marker: PhantomData,
+            };
 
-            let service_result = service.call(req).await?;
-
-            // Only store in cache if we're considering caching and the response is successful
-            if should_cache && service_result.status().is_success() {
-                let res = service_result.response();
-
-                let status = res.status().as_u16();
-
-                let headers = res
-                    .headers()
-                    .iter()
-                    .filter(|(name, _)| {
-                        !["connection", "transfer-encoding", "content-length"]
-                            .contains(&name.as_str().to_lowercase().as_str())
-                    })
-                    .map(|(name, value)| {
-                        (
-                            name.to_string(),
-                            value.to_str().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-
-                if let Ok(body) = res.body().clone().try_into_bytes() {
-                    if !body.is_empty() && body.len() <= max_cacheable_size {
-                        let cached_response = CachedResponse {
-                            status,
-                            headers,
-                            body: body.to_vec(),
-                        };
-
-                        if let Ok(serialized) = serde_json::to_string(&cached_response) {
-                            if redis_conn.is_none() {
-                                let client = redis::Client::open(redis_url.as_str())
-                                    .expect("Failed to connect to Redis");
-
-                                let conn = client
-                                    .get_multiplexed_async_connection()
-                                    .await
-                                    .expect("Failed to get Redis connection");
-
-                                redis_conn = Some(conn);
-                            }
-
-                            let conn = redis_conn.as_mut().unwrap();
-                            let _: Result<(), redis::RedisError> =
-                                conn.set_ex(cache_key, serialized, expiration).await;
-                        }
-                    }
-                }
-            }
-
-            Ok(service_result.map_body(|_, b| EitherBody::left(b)))
+            future.await
         })
     }
 }
