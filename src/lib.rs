@@ -414,7 +414,7 @@ pin_project! {
                         body: body_bytes.to_vec(),
                     };
 
-                    if let Ok(serialized) = serde_json::to_string(&cached_response) {
+                    if let Ok(serialized) = rmp_serde::to_vec(&cached_response) {
                         if redis_conn.is_none() {
                             let client = redis::Client::open(redis_url.as_str())
                                 .expect("Failed to connect to Redis");
@@ -544,7 +544,7 @@ where
             let hashed_key = hex::encode(Sha256::digest(base_key.as_bytes()));
             let cache_key = format!("{}{}", cache_prefix, hashed_key);
 
-            let cached_result: Option<String> = if should_cache {
+            let cached_result: Option<Vec<u8>> = if should_cache {
                 if redis_conn.is_none() {
                     let client = redis::Client::open(redis_url.as_str())
                         .expect("Failed to connect to Redis");
@@ -566,7 +566,7 @@ where
             if let Some(cached_data) = cached_result {
                 log::debug!("Cache hit for {}", cache_key);
 
-                match serde_json::from_str::<CachedResponse>(&cached_data) {
+                match rmp_serde::from_slice::<CachedResponse>(&cached_data) {
                     Ok(cached_response) => {
                         let mut response = actix_web::HttpResponse::build(
                             actix_web::http::StatusCode::from_u16(cached_response.status)
@@ -851,10 +851,10 @@ mod tests {
         };
 
         // Serialize
-        let serialized = serde_json::to_string(&cached_response).unwrap();
+        let serialized = rmp_serde::to_vec(&cached_response).unwrap();
 
         // Deserialize
-        let deserialized: CachedResponse = serde_json::from_str(&serialized).unwrap();
+        let deserialized: CachedResponse = rmp_serde::from_slice(&serialized).unwrap();
 
         // Verify fields match
         assert_eq!(deserialized.status, 200);
