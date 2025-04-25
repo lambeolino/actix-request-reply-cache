@@ -7,7 +7,7 @@ description = "A simple request/reply cache middleware for Actix Web with Redis 
 repository = "https://github.com/densumesh/actix-request-reply-cache"
 
 [dependencies]
-actix-web = "4"
+actix-web = "4.9"
 redis = { version = "0.30", features = ["tokio-comp"] }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }

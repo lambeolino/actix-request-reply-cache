@@ -88,7 +88,8 @@ type CachePredicate = Arc<dyn Fn(&CacheDecisionContext) -> bool + Send + Sync>;
 /// This middleware intercepts responses, caches them in Redis, and serves
 /// cached responses for subsequent matching requests when available.
 pub struct RedisCacheMiddleware {
-    redis_conn: MultiplexedConnection,
+    redis_conn: Option<MultiplexedConnection>,
+    redis_url: String,
     ttl: u64,
     max_cacheable_size: usize,
     cache_prefix: String,
@@ -218,21 +219,10 @@ impl RedisCacheMiddlewareBuilder {
     /// # Returns
     ///
     /// A new `RedisCacheMiddleware` instance configured with the settings from this builder.
-    ///
-    /// # Panics
-    ///
-    /// This method will panic if it cannot connect to Redis using the provided URL.
-    pub async fn build(self) -> RedisCacheMiddleware {
-        let client =
-            redis::Client::open(self.redis_url.as_str()).expect("Failed to connect to Redis");
-
-        let redis_conn = client
-            .get_multiplexed_async_connection()
-            .await
-            .expect("Failed to get Redis connection");
-
+    pub fn build(self) -> RedisCacheMiddleware {
         RedisCacheMiddleware {
-            redis_conn,
+            redis_conn: None,
+            redis_url: self.redis_url,
             ttl: self.ttl,
             max_cacheable_size: self.max_cacheable_size,
             cache_prefix: self.cache_prefix,
@@ -253,8 +243,8 @@ impl RedisCacheMiddleware {
     /// # Returns
     ///
     /// A new `RedisCacheMiddleware` instance with default settings.
-    pub async fn new(redis_url: &str) -> Self {
-        RedisCacheMiddlewareBuilder::new(redis_url).build().await
+    pub fn new(redis_url: &str) -> Self {
+        RedisCacheMiddlewareBuilder::new(redis_url).build()
     }
 }
 
@@ -264,7 +254,8 @@ impl RedisCacheMiddleware {
 /// the actual interception of requests and responses for caching.
 pub struct RedisCacheMiddlewareService<S> {
     service: S,
-    redis_conn: MultiplexedConnection,
+    redis_conn: Option<MultiplexedConnection>,
+    redis_url: String,
     ttl: u64,
     max_cacheable_size: usize,
     cache_prefix: String,
@@ -294,6 +285,7 @@ where
         ready(Ok(RedisCacheMiddlewareService {
             service,
             redis_conn: self.redis_conn.clone(),
+            redis_url: self.redis_url.clone(),
             ttl: self.ttl,
             max_cacheable_size: self.max_cacheable_size,
             cache_prefix: self.cache_prefix.clone(),
@@ -328,6 +320,7 @@ where
             }
         }
 
+        let redis_url = self.redis_url.clone();
         let mut redis_conn = self.redis_conn.clone();
         let expiration = self.ttl;
         let max_cacheable_size = self.max_cacheable_size;
@@ -381,7 +374,20 @@ where
 
             // Only try to get from cache if we're considering caching for this request
             let cached_result: Option<String> = if should_cache {
-                redis_conn.get(&cache_key).await.unwrap_or(None)
+                if redis_conn.is_none() {
+                    let client = redis::Client::open(redis_url.as_str())
+                        .expect("Failed to connect to Redis");
+
+                    let conn = client
+                        .get_multiplexed_async_connection()
+                        .await
+                        .expect("Failed to get Redis connection");
+
+                    redis_conn = Some(conn);
+                }
+
+                let conn = redis_conn.as_mut().unwrap();
+                conn.get(&cache_key).await.unwrap_or(None)
             } else {
                 None
             };
@@ -448,8 +454,21 @@ where
                         };
 
                         if let Ok(serialized) = serde_json::to_string(&cached_response) {
+                            if redis_conn.is_none() {
+                                let client = redis::Client::open(redis_url.as_str())
+                                    .expect("Failed to connect to Redis");
+
+                                let conn = client
+                                    .get_multiplexed_async_connection()
+                                    .await
+                                    .expect("Failed to get Redis connection");
+
+                                redis_conn = Some(conn);
+                            }
+
+                            let conn = redis_conn.as_mut().unwrap();
                             let _: Result<(), redis::RedisError> =
-                                redis_conn.set_ex(cache_key, serialized, expiration).await;
+                                conn.set_ex(cache_key, serialized, expiration).await;
                         }
                     }
                 }
