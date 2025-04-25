@@ -58,6 +58,7 @@ use futures::{
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// Context used to determine if a request/response should be cached.
@@ -253,7 +254,7 @@ impl RedisCacheMiddleware {
 /// This struct is created by the `RedisCacheMiddleware` and handles
 /// the actual interception of requests and responses for caching.
 pub struct RedisCacheMiddlewareService<S> {
-    service: S,
+    service: Rc<S>,
     redis_conn: Option<MultiplexedConnection>,
     redis_url: String,
     ttl: u64,
@@ -271,7 +272,7 @@ struct CachedResponse {
 
 impl<S, B> Transform<S, ServiceRequest> for RedisCacheMiddleware
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static + Clone,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: 'static + Clone + MessageBody,
 {
@@ -281,9 +282,10 @@ where
     type InitError = ();
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
+    /// Creates a new transform of the input service.
     fn new_transform(&self, service: S) -> Self::Future {
         ready(Ok(RedisCacheMiddlewareService {
-            service,
+            service: Rc::new(service),
             redis_conn: self.redis_conn.clone(),
             redis_url: self.redis_url.clone(),
             ttl: self.ttl,
@@ -296,7 +298,7 @@ where
 
 impl<S, B> Service<ServiceRequest> for RedisCacheMiddlewareService<S>
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static + Clone,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: actix_web::body::MessageBody + 'static + Clone,
 {
@@ -325,7 +327,7 @@ where
         let expiration = self.ttl;
         let max_cacheable_size = self.max_cacheable_size;
         let cache_prefix = self.cache_prefix.clone();
-        let service = self.service.clone();
+        let service = Rc::clone(&self.service);
         let cache_if = self.cache_if.clone();
 
         Box::pin(async move {
