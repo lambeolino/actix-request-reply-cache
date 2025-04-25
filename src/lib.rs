@@ -447,12 +447,10 @@ where
                             body: body.to_vec(),
                         };
 
-                        tokio::spawn(async move {
-                            if let Ok(serialized) = serde_json::to_string(&cached_response) {
-                                let _: Result<(), redis::RedisError> =
-                                    redis_conn.set_ex(cache_key, serialized, expiration).await;
-                            }
-                        });
+                        if let Ok(serialized) = serde_json::to_string(&cached_response) {
+                            let _: Result<(), redis::RedisError> =
+                                redis_conn.set_ex(cache_key, serialized, expiration).await;
+                        }
                     }
                 }
             }
