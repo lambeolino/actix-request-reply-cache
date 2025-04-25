@@ -65,11 +65,12 @@ use std::{
     task::{Context, Poll},
 };
 
-/// Context used to determine if a request/response should be cached.
+/// Context containing request information for cache operations.
 ///
-/// This struct contains information about the current request that can be
-/// examined by cache predicate functions to make caching decisions.
-pub struct CacheDecisionContext<'a> {
+/// This struct contains information about the current request that can be used for:
+/// - Making caching decisions through predicate functions
+/// - Generating custom cache keys
+pub struct CacheContext<'a> {
     /// The HTTP method of the request (e.g., "GET", "POST")
     pub method: &'a str,
     /// The request path
@@ -86,7 +87,13 @@ pub struct CacheDecisionContext<'a> {
 ///
 /// This type represents functions that take a `CacheDecisionContext` and return
 /// a boolean indicating whether the response should be cached.
-type CachePredicate = Arc<dyn Fn(&CacheDecisionContext) -> bool + Send + Sync>;
+type CachePredicate = Arc<dyn Fn(&CacheContext) -> bool + Send + Sync>;
+
+/// Function type for custom cache key generation.
+///
+/// This type represents functions that take a `CacheDecisionContext` and return
+/// a string to be used as the base for the cache key.
+type CacheKeyFn = Arc<dyn Fn(&CacheContext) -> String + Send + Sync>;
 
 /// Redis-backed caching middleware for Actix Web.
 ///
@@ -99,6 +106,7 @@ pub struct RedisCacheMiddleware {
     max_cacheable_size: usize,
     cache_prefix: String,
     cache_if: CachePredicate,
+    cache_key_fn: Option<CacheKeyFn>,
 }
 
 /// Builder for configuring and creating the `RedisCacheMiddleware`.
@@ -111,6 +119,7 @@ pub struct RedisCacheMiddlewareBuilder {
     max_cacheable_size: usize,
     cache_prefix: String,
     cache_if: CachePredicate,
+    cache_key_fn: Option<CacheKeyFn>,
 }
 
 impl RedisCacheMiddlewareBuilder {
@@ -134,6 +143,7 @@ impl RedisCacheMiddlewareBuilder {
             max_cacheable_size: 1024 * 1024, // 1MB default
             cache_prefix: "cache:".to_string(),
             cache_if: Arc::new(|_| true), // Default: cache everything
+            cache_key_fn: None,           // Default: use standard key generation
         }
     }
 
@@ -203,19 +213,43 @@ impl RedisCacheMiddlewareBuilder {
     ///
     ///     // Don't cache for a specific route if its body contains some field
     ///     if ctx.path.starts_with("/api/users") && ctx.method == "POST" {
-    ///        if let Ok(user_json) = serde_json::from_slice::<serde_json::Value>(ctx.body) {
-    ///            // Check properties in the JSON to make caching decisions
-    ///            return user_json.get("role").and_then(|r| r.as_str()) != Some("admin");
-    ///        }
-    ///    }
+    ///         return ctx.body.get("role").and_then(|r| r.as_str()) != Some("admin");
+    ///     }
     ///     true
     /// })
     /// ```
     pub fn cache_if<F>(mut self, predicate: F) -> Self
     where
-        F: Fn(&CacheDecisionContext) -> bool + Send + Sync + 'static,
+        F: Fn(&CacheContext) -> bool + Send + Sync + 'static,
     {
         self.cache_if = Arc::new(predicate);
+        self
+    }
+
+    /// Set a custom function to determine the cache key.
+    ///
+    /// By default, cache keys are based on HTTP method, path, query string, and
+    /// (if present) a hash of the request body. This method lets you specify a custom
+    /// function to generate the base key before hashing.
+    ///
+    /// Example:
+    /// ```
+    /// builder.with_cache_key(|ctx| {
+    ///     // Only use method and path for the cache key (ignore query params and body)
+    ///     format!("{}:{}", ctx.method, ctx.path)
+    ///     
+    ///     // Or include specific query parameters
+    ///     // let user_id = ctx.query_string.split('&')
+    ///     //     .find(|p| p.starts_with("user_id="))
+    ///     //     .unwrap_or("");
+    ///     // format!("{}:{}:{}", ctx.method, ctx.path, user_id)
+    /// })
+    /// ```
+    pub fn with_cache_key<F>(mut self, key_fn: F) -> Self
+    where
+        F: Fn(&CacheContext) -> String + Send + Sync + 'static,
+    {
+        self.cache_key_fn = Some(Arc::new(key_fn));
         self
     }
 
@@ -232,6 +266,7 @@ impl RedisCacheMiddlewareBuilder {
             max_cacheable_size: self.max_cacheable_size,
             cache_prefix: self.cache_prefix,
             cache_if: self.cache_if,
+            cache_key_fn: self.cache_key_fn,
         }
     }
 }
@@ -265,6 +300,7 @@ pub struct RedisCacheMiddlewareService<S> {
     max_cacheable_size: usize,
     cache_prefix: String,
     cache_if: CachePredicate,
+    cache_key_fn: Option<CacheKeyFn>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -296,6 +332,7 @@ where
             max_cacheable_size: self.max_cacheable_size,
             cache_prefix: self.cache_prefix.clone(),
             cache_if: self.cache_if.clone(),
+            cache_key_fn: self.cache_key_fn.clone(),
         }))
     }
 }
@@ -498,6 +535,7 @@ where
         let cache_prefix = self.cache_prefix.clone();
         let service = Rc::clone(&self.service);
         let cache_if = self.cache_if.clone();
+        let cache_key_fn = self.cache_key_fn.clone();
 
         Box::pin(async move {
             let body_bytes = req
@@ -510,7 +548,7 @@ where
                 })
                 .await;
 
-            let cache_ctx = CacheDecisionContext {
+            let cache_ctx = CacheContext {
                 method: req.method().as_str(),
                 path: req.path(),
                 query_string: req.query_string(),
@@ -520,10 +558,10 @@ where
 
             let should_cache = cache_if(&cache_ctx);
 
-            req.set_payload(Payload::from(Bytes::from(body_bytes.clone())));
-
-            // Generate cache key
-            let base_key = if body_bytes.is_empty() {
+            // Generate cache key using custom function if provided, otherwise use the default
+            let base_key = if let Some(key_fn) = &cache_key_fn {
+                key_fn(&cache_ctx)
+            } else if body_bytes.is_empty() {
                 format!(
                     "{}:{}:{}",
                     req.method().as_str(),
@@ -540,6 +578,8 @@ where
                     body_hash
                 )
             };
+
+            req.set_payload(Payload::from(Bytes::from(body_bytes.clone())));
 
             let hashed_key = hex::encode(Sha256::digest(base_key.as_bytes()));
             let cache_key = format!("{}{}", cache_prefix, hashed_key);
@@ -639,7 +679,7 @@ mod tests {
             .cache_if(|ctx| ctx.method == "GET");
 
         // Test the predicate
-        let get_ctx = CacheDecisionContext {
+        let get_ctx = CacheContext {
             method: "GET",
             path: "/test",
             query_string: "",
@@ -647,7 +687,7 @@ mod tests {
             body: &serde_json::Value::Null,
         };
 
-        let post_ctx = CacheDecisionContext {
+        let post_ctx = CacheContext {
             method: "POST",
             path: "/test",
             query_string: "",
@@ -715,7 +755,7 @@ mod tests {
         let methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
 
         for method in methods {
-            let ctx = CacheDecisionContext {
+            let ctx = CacheContext {
                 method,
                 path: "/test",
                 query_string: "",
@@ -736,7 +776,7 @@ mod tests {
             .cache_if(|ctx| matches!(ctx.method, "GET" | "HEAD"));
 
         for method in methods {
-            let ctx = CacheDecisionContext {
+            let ctx = CacheContext {
                 method,
                 path: "/test",
                 query_string: "",
@@ -761,11 +801,11 @@ mod tests {
         // Test predicate behavior with different headers
 
         // Create a predicate that doesn't cache requests with Authorization header
-        let predicate = |ctx: &CacheDecisionContext| !ctx.headers.contains_key("Authorization");
+        let predicate = |ctx: &CacheContext| !ctx.headers.contains_key("Authorization");
 
         // Test with empty headers
         let mut headers = header::HeaderMap::new();
-        let ctx_no_auth = CacheDecisionContext {
+        let ctx_no_auth = CacheContext {
             method: "GET",
             path: "/test",
             query_string: "",
@@ -784,7 +824,7 @@ mod tests {
             header::HeaderValue::from_static("Bearer token"),
         );
 
-        let ctx_with_auth = CacheDecisionContext {
+        let ctx_with_auth = CacheContext {
             method: "GET",
             path: "/test",
             query_string: "",
@@ -803,15 +843,14 @@ mod tests {
         // Test predicate behavior with different path patterns
 
         // Create a predicate that doesn't cache admin paths
-        let predicate = |ctx: &CacheDecisionContext| {
-            !ctx.path.starts_with("/admin") && !ctx.path.contains("/private/")
-        };
+        let predicate =
+            |ctx: &CacheContext| !ctx.path.starts_with("/admin") && !ctx.path.contains("/private/");
 
         // Test paths that should be cached
         let cacheable_paths = ["/", "/api/users", "/public/resource", "/api/v1/data"];
 
         for path in cacheable_paths {
-            let ctx = CacheDecisionContext {
+            let ctx = CacheContext {
                 method: "GET",
                 path,
                 query_string: "",
@@ -826,7 +865,7 @@ mod tests {
         let non_cacheable_paths = ["/admin", "/admin/users", "/users/private/profile"];
 
         for path in non_cacheable_paths {
-            let ctx = CacheDecisionContext {
+            let ctx = CacheContext {
                 method: "GET",
                 path,
                 query_string: "",
@@ -864,5 +903,53 @@ mod tests {
         assert_eq!(deserialized.headers[1].0, "X-Test");
         assert_eq!(deserialized.headers[1].1, "value");
         assert_eq!(deserialized.body, b"test response");
+    }
+
+    #[actix_web::test]
+    async fn test_custom_cache_key() {
+        // Create a builder with a custom cache key function that only uses method and path
+        let builder = RedisCacheMiddlewareBuilder::new("redis://localhost")
+            .with_cache_key(|ctx| format!("{}:{}", ctx.method, ctx.path));
+
+        // Create a function that extracts our cache key generation logic
+        let get_key = |method: &str, path: &str, query: &str, body: &[u8]| {
+            // Create a CacheDecisionContext
+            let headers = header::HeaderMap::new();
+            let body_json = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+            let ctx = CacheContext {
+                method,
+                path,
+                query_string: query,
+                headers: &headers,
+                body: &body_json,
+            };
+
+            // Get the base key using our cache key function
+            let base_key = if let Some(key_fn) = &builder.cache_key_fn {
+                key_fn(&ctx)
+            } else {
+                format!("{}:{}:{}", method, path, query)
+            };
+
+            // Hash it and apply prefix as done in the middleware
+            let hashed_key = hex::encode(Sha256::digest(base_key.as_bytes()));
+            format!("{}:{}", builder.cache_prefix, hashed_key)
+        };
+
+        // Test with different query strings that should now produce the same cache key
+        let key1 = get_key("GET", "/users", "", b"");
+        let key2 = get_key("GET", "/users", "page=1", b"");
+        let key3 = get_key("GET", "/users", "page=2", b"");
+
+        // Keys should be the same since our custom function ignores query string
+        assert_eq!(key1, key2);
+        assert_eq!(key1, key3);
+
+        // Test with different methods that should produce different cache keys
+        let key_get = get_key("GET", "/resource", "", b"");
+        let key_post = get_key("POST", "/resource", "", b"");
+
+        // Should be different keys
+        assert_ne!(key_get, key_post);
     }
 }
