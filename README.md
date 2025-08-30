@@ -35,8 +35,7 @@ use actix_request_reply_cache::RedisCacheMiddlewareBuilder;
 async fn main() -> std::io::Result<()> {
     // Create the cache middleware with default settings
     let cache = RedisCacheMiddlewareBuilder::new("redis://127.0.0.1:6379")
-        .build()
-        .await;
+        .build();
         
     HttpServer::new(move || {
         App::new()
