@@ -99,6 +99,7 @@ type CacheKeyFn = Arc<dyn Fn(&CacheContext) -> String + Send + Sync>;
 ///
 /// This middleware intercepts responses, caches them in Redis, and serves
 /// cached responses for subsequent matching requests when available.
+#[derive(Clone)]
 pub struct RedisCacheMiddleware {
     redis_conn: Option<MultiplexedConnection>,
     redis_url: String,
